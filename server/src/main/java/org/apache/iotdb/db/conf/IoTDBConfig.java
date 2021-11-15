@@ -115,7 +115,7 @@ public class IoTDBConfig {
   private long allocateMemoryForRead = Runtime.getRuntime().maxMemory() * 3 / 10;
 
   /** Memory allocated for the mtree */
-  private long allocateMemoryForSchema = Runtime.getRuntime().maxMemory() * 1 / 10;
+  private long allocateMemoryForSchema = Runtime.getRuntime().maxMemory() * 2 / 10;
 
   /** Memory allocated for the read process besides cache */
   private long allocateMemoryForReadWithoutCache = allocateMemoryForRead * 3 / 10;

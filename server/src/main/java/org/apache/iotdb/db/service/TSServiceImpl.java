@@ -1242,6 +1242,7 @@ public class TSServiceImpl implements TSIService.Iface {
           req.deviceIds.get(0),
           req.getTimestamps().get(0));
     }
+    long startTs = System.nanoTime();
     boolean allCheckSuccess = true;
     InsertRowsPlan insertRowsPlan = new InsertRowsPlan();
     for (int i = 0; i < req.deviceIds.size(); i++) {
@@ -1270,6 +1271,11 @@ public class TSServiceImpl implements TSIService.Iface {
     }
     TSStatus tsStatus = executeNonQueryPlan(insertRowsPlan);
 
+    long endTs = System.nanoTime();
+    long cost = (endTs - startTs) / 1000000;
+    if (cost > 500) {
+      AUDIT_LOGGER.info("Request {} spend {}ms", req.toString(), cost);
+    }
     return judgeFinalTsStatus(
         allCheckSuccess, tsStatus, insertRowsPlan.getResults(), req.deviceIds.size());
   }
@@ -1655,6 +1661,8 @@ public class TSServiceImpl implements TSIService.Iface {
             "Session-{} create timeseries {}", sessionManager.getCurrSessionId(), req.getPath());
       }
 
+      long startTs = System.nanoTime();
+
       CreateTimeSeriesPlan plan =
           new CreateTimeSeriesPlan(
               new PartialPath(req.path),
@@ -1667,6 +1675,11 @@ public class TSServiceImpl implements TSIService.Iface {
               req.measurementAlias);
 
       TSStatus status = checkAuthority(plan, req.getSessionId());
+      long endTs = System.nanoTime();
+      long cost = (endTs - startTs) / 1000000;
+      if (cost > 500) {
+        AUDIT_LOGGER.info("Request {} spend {}ms", req.toString(), cost);
+      }
       return status != null ? status : executeNonQueryPlan(plan);
     } catch (Exception e) {
       return onNPEOrUnexpectedException(
