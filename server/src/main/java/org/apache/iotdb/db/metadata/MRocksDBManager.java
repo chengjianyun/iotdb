@@ -33,6 +33,17 @@ public class MRocksDBManager {
     options.setCreateIfMissing(true);
 
     rocksDB = RocksDB.open(options, dbPath);
+    // TODO: make sure `root` existed
+  }
+
+  private void initRootNode() {
+      Holder holder = new Holder();
+      if (rocksDB.keyMayExist(ROOT.getBytes(), holder) && holder.getValue() != null) {
+          return;
+      }
+
+
+
   }
 
   public void setStorageGroup(PartialPath storageGroup) throws MetadataException {
@@ -62,7 +73,7 @@ public class MRocksDBManager {
    * @throws RocksDBException, throw Rocksdb exception if natively exception happened
    */
   private void createStorageGroup(String[] nodes, int i, int length) throws RocksDBException {
-    if (length <= 1) {
+    if (i < 1) {
       return;
     }
     String key;
@@ -72,15 +83,27 @@ public class MRocksDBManager {
       key = createKey(nodes, i);
     }
     Holder<byte[]> holder = new Holder<>();
-    if (rocksDB.keyMayExist(key.getBytes(), holder)) {
-      if (holder.getValue() != null) {
-        if (i < length) {
-          rocksDB.merge(key.getBytes(), nodes[i].getBytes());
-        }
-        return;
+    if (!rocksDB.keyMayExist(key.getBytes(), holder)) {
+      createStorageGroup(nodes, i - 1, length);
+    } else {
+      if (holder.getValue() == null) {
+        createStorageGroup(nodes, i - 1, length);
       }
     }
-    createStorageGroup(nodes, i - 1, length);
+
+      if (i < length) {
+        byte[] appendVal;
+        // TODO: read raw properties
+        rawValue =
+        appendVal = nodes[i].getBytes();
+        // TODO: append new node to key
+        rocksDB.put(key.getBytes(), "new value".getBytes());
+      }
+      // TODO: get child value
+       byte[] childValue = "".getBytes();
+      // create child node
+      rocksDB.put(key.getBytes(), childValue);
+
   }
 
   private String createKey(String[] nodes, int len, String prefix) {
@@ -121,6 +144,6 @@ public class MRocksDBManager {
     // StorageGroupNoTSet exception
     // TODO: check storage group
 
-    
+
   }
 }
