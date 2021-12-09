@@ -51,6 +51,7 @@ import org.apache.iotdb.db.query.dataset.ShowDevicesResult;
 import org.apache.iotdb.db.query.dataset.ShowTimeSeriesResult;
 import org.apache.iotdb.db.rescon.MemTableManager;
 import org.apache.iotdb.db.service.IoTDB;
+import org.apache.iotdb.db.utils.FileUtils;
 import org.apache.iotdb.db.utils.SchemaUtils;
 import org.apache.iotdb.db.utils.TestOnly;
 import org.apache.iotdb.db.utils.TypeInferenceUtils;
@@ -67,11 +68,13 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.ScheduledExecutorService;
@@ -79,6 +82,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.iotdb.db.conf.IoTDBConstant.MULTI_LEVEL_PATH_WILDCARD;
+import static org.apache.iotdb.db.metadata.MRocksDBManager.dbPath;
 import static org.apache.iotdb.db.utils.EncodingInferenceUtils.getDefaultEncoding;
 import static org.apache.iotdb.tsfile.common.constant.TsFileConstant.PATH_SEPARATOR;
 
@@ -224,22 +228,179 @@ public class MManager {
     logFile = SystemFileFactory.INSTANCE.getFile(logFilePath);
 
     try {
-      isRecovering = true;
+      isRecovering = false;
+      //      tagManager.init();
 
-      tagManager.init();
-      mtree = new MTree();
-      mtree.init();
+      resetEnv();
 
-      int lineNumber = initFromLog(logFile);
-
-      logWriter = new MLogWriter(config.getSchemaDir(), MetadataConstant.METADATA_LOG);
+      int lineNumber = 0;
+      logWriter = new MLogWriter(config.getSchemaDir(), MetadataConstant.METADATA_LOG + ".temp");
       logWriter.setLogNum(lineNumber);
       isRecovering = false;
-    } catch (IOException e) {
+
+      prepareBenchmark();
+
+      System.out.println(
+          "\n\n#################################mtree benchmark statistics#################################");
+      mtree = new MTree();
+      benchStorageGroupCreation();
+      benchTimeSeriesCreation();
+      benchQuery();
+
+      System.out.println(
+          "\n\n#################################rocksdb benchmark statistics#################################");
+      MRocksDBManager mRocksDBManager = new MRocksDBManager();
+      mRocksDBManager.benchStorageGroupCreation();
+      mRocksDBManager.benchTimeSeriesCreation();
+      mRocksDBManager.benchQuery();
+
+    } catch (IOException | RocksDBException e) {
       logger.error(
           "Cannot recover all MTree from file, we try to recover as possible as we can", e);
     }
     initialized = true;
+  }
+
+  private void resetEnv() throws IOException {
+    File tempMlog =
+        SystemFileFactory.INSTANCE.getFile(
+            config.getSchemaDir() + File.separator + MetadataConstant.METADATA_LOG + ".temp");
+    Files.deleteIfExists(tempMlog.toPath());
+
+    File rockdDbFile = new File(dbPath);
+    if (rockdDbFile.exists() && rockdDbFile.isDirectory()) {
+      FileUtils.deleteDirectory(rockdDbFile);
+    }
+  }
+
+  public static List<List<CreateTimeSeriesPlan>> timeSeriesSet = new ArrayList<>();
+
+  public static List<String> queryTsSet = new ArrayList<>();
+
+  public static List<SetStorageGroupPlan> storageGroups = new ArrayList<>();
+  public static final int BIN_CAPACITY = 100 * 1000;
+
+  public static int QUERY_EXIST_CAPACITY = 100 * 1000;
+  public static int QUERY_NON_EXIST_CAPACITY = 10 * 1000;
+
+  public static int STORAGE_GROUP_THREAD_NUM = 10;
+  public static int TIME_SERIES_THREAD_NUM = 20;
+  public static int QUERY_THREAD_NUM = 20;
+
+  public void prepareBenchmark() throws IOException {
+    long time = System.currentTimeMillis();
+    // init the metadata from the operation log
+    if (logFile.exists()) {
+      int idx = 0;
+      try (MLogReader mLogReader =
+          new MLogReader(config.getSchemaDir(), MetadataConstant.METADATA_LOG); ) {
+        prepareRawData(mLogReader);
+        logger.info(
+            "spend {} ms to deserialize mtree from mlog.bin", System.currentTimeMillis() - time);
+      } catch (Exception e) {
+        throw new IOException("Failed to parser mlog.bin for err:" + e);
+      }
+    }
+  }
+
+  private static void prepareRawData(MLogReader mLogReader) {
+    List<CreateTimeSeriesPlan> currentList = null;
+    int existQueryCount = 0;
+    int nonExistQueryCount = 0;
+    while (mLogReader.hasNext()) {
+      PhysicalPlan plan = null;
+      try {
+        plan = mLogReader.next();
+        if (plan == null) {
+          continue;
+        }
+
+        switch (plan.getOperatorType()) {
+          case CREATE_TIMESERIES:
+            CreateTimeSeriesPlan createTimeSeriesPlan = (CreateTimeSeriesPlan) plan;
+            if (currentList == null) {
+              currentList = new ArrayList<>(BIN_CAPACITY);
+              timeSeriesSet.add(currentList);
+            }
+            currentList.add(createTimeSeriesPlan);
+            if (currentList.size() >= BIN_CAPACITY) {
+              currentList = null;
+            }
+
+            Random random = new Random();
+            int i = random.nextInt(1000);
+            if (i <= 1 && nonExistQueryCount < QUERY_NON_EXIST_CAPACITY) {
+              queryTsSet.add(createTimeSeriesPlan.getPath().getFullPath() + "." + random.nextInt());
+            }
+
+            if (i >= 10 && i < 1000 && existQueryCount < QUERY_EXIST_CAPACITY) {
+              queryTsSet.add(createTimeSeriesPlan.getPath().getFullPath());
+            }
+            break;
+          case SET_STORAGE_GROUP:
+            SetStorageGroupPlan setStorageGroupPlan = (SetStorageGroupPlan) plan;
+            storageGroups.add(setStorageGroupPlan);
+            break;
+          default:
+            break;
+        }
+      } catch (Exception e) {
+        logger.error(
+            "Can not operate cmd {} for err:", plan == null ? "" : plan.getOperatorType(), e);
+      }
+    }
+    System.out.println("storage group size: " + storageGroups.size());
+    System.out.println("timeseries seize: " + timeSeriesSet.size());
+    System.out.println("query size: " + queryTsSet.size());
+  }
+
+  public void benchStorageGroupCreation() {
+    BenchmarkTask<SetStorageGroupPlan> task =
+        new BenchmarkTask<>(storageGroups, STORAGE_GROUP_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        setStorageGroupPlan -> {
+          try {
+            setStorageGroup(setStorageGroupPlan.getPath());
+            return true;
+          } catch (Exception e) {
+            return false;
+          }
+        });
+  }
+
+  public void benchTimeSeriesCreation() {
+    BenchmarkTask<List<CreateTimeSeriesPlan>> task =
+        new BenchmarkTask<>(timeSeriesSet, TIME_SERIES_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        createTimeSeriesPlans -> {
+          createTimeSeriesPlans.stream()
+              .forEach(
+                  ts -> {
+                    try {
+                      createTimeseries(ts);
+                    } catch (MetadataException e) {
+                      e.printStackTrace();
+                    }
+                  });
+          return true;
+        });
+  }
+
+  public void benchQuery() {
+    BenchmarkTask<String> task =
+        new BenchmarkTask<>(queryTsSet, QUERY_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        s -> {
+          try {
+            IMNode node = getMeasurementMNode(new PartialPath(s));
+            if (node != null) {
+              node.toString();
+            }
+            return true;
+          } catch (Exception e) {
+            return false;
+          }
+        });
   }
 
   /** @return line number of the logFile */
@@ -467,11 +628,11 @@ public class MManager {
       // write log
       if (!isRecovering) {
         // either tags or attributes is not empty
-        if ((plan.getTags() != null && !plan.getTags().isEmpty())
-            || (plan.getAttributes() != null && !plan.getAttributes().isEmpty())) {
-          offset = tagManager.writeTagFile(plan.getTags(), plan.getAttributes());
-        }
-        plan.setTagOffset(offset);
+        //        if ((plan.getTags() != null && !plan.getTags().isEmpty())
+        //            || (plan.getAttributes() != null && !plan.getAttributes().isEmpty())) {
+        //          offset = tagManager.writeTagFile(plan.getTags(), plan.getAttributes());
+        //        }
+        plan.setTagOffset(-1);
         logWriter.createTimeseries(plan);
       }
       leafMNode.setOffset(offset);

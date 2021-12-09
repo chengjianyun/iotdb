@@ -1,28 +1,43 @@
 package org.apache.iotdb.db.metadata;
 
 import org.apache.iotdb.db.exception.metadata.MetadataException;
+import org.apache.iotdb.db.exception.metadata.PathAlreadyExistException;
+import org.apache.iotdb.db.metadata.mnode.EntityMNode;
+import org.apache.iotdb.db.metadata.mnode.IMNode;
 import org.apache.iotdb.db.metadata.path.PartialPath;
 import org.apache.iotdb.db.qp.physical.sys.CreateTimeSeriesPlan;
+import org.apache.iotdb.db.qp.physical.sys.SetStorageGroupPlan;
 import org.apache.iotdb.db.utils.SchemaUtils;
+import org.apache.iotdb.tsfile.file.metadata.enums.CompressionType;
+import org.apache.iotdb.tsfile.file.metadata.enums.TSDataType;
+import org.apache.iotdb.tsfile.file.metadata.enums.TSEncoding;
 
-import org.rocksdb.Holder;
-import org.rocksdb.Options;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
+import com.google.common.util.concurrent.Striped;
+import org.rocksdb.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.locks.Lock;
+
+import static org.apache.iotdb.db.metadata.MManager.*;
 import static org.apache.iotdb.tsfile.common.constant.TsFileConstant.PATH_SEPARATOR;
 
 public class MRocksDBManager {
 
-  private static final String dbPath = "./rocksdb-data/";
+  public static final String dbPath = "./rocksdb-data/";
   private static final String cfdbPath = "./rocksdb-data-cf/";
 
   private final Options options;
   private final RocksDB rocksDB;
 
   private static final String ROOT = "r";
-  private static final String SG_NODE_PREFIX = "G";
-  private static final String MEASUREMENT_NODE_PREFIX = "M";
+  private static final String SG_NODE_PREFIX = "s";
+  private static final String DEVICE_NODE_PREFIX = "d";
+  private static final String MEASUREMENT_NODE_PREFIX = "m";
+
+  private static final Logger logger = LoggerFactory.getLogger(MRocksDBManager.class);
 
   static {
     RocksDB.loadLibrary();
@@ -34,26 +49,29 @@ public class MRocksDBManager {
 
     rocksDB = RocksDB.open(options, dbPath);
     // TODO: make sure `root` existed
+    if (rocksDB.get(ROOT.getBytes()) == null) {
+      rocksDB.put(ROOT.getBytes(), "".getBytes());
+    }
   }
 
   private void initRootNode() {
-      Holder holder = new Holder();
-      if (rocksDB.keyMayExist(ROOT.getBytes(), holder) && holder.getValue() != null) {
-          return;
-      }
-
-
-
+    Holder holder = new Holder();
+    if (rocksDB.keyMayExist(ROOT.getBytes(), holder) && holder.getValue() != null) {
+      return;
+    }
   }
 
   public void setStorageGroup(PartialPath storageGroup) throws MetadataException {
     String[] nodes = storageGroup.getNodes();
     try {
-      createStorageGroup(nodes, nodes.length, nodes.length);
+      insertByNodes(nodes, nodes.length, nodes.length);
     } catch (RocksDBException e) {
-      e.printStackTrace();
+      throw new MetadataException(e);
     }
   }
+
+  // TODO: check how Stripped Lock consume memory
+  Striped<Lock> locks = Striped.lazyWeakLock(10000);
 
   /**
    * For given nodes in order, create needed node recursively. e.g. Input nodes: [root, a, b, c],
@@ -72,68 +90,197 @@ public class MRocksDBManager {
    * @param length of nodes
    * @throws RocksDBException, throw Rocksdb exception if natively exception happened
    */
-  private void createStorageGroup(String[] nodes, int i, int length) throws RocksDBException {
+  private void insertByNodes(String[] nodes, int i, int length)
+      throws RocksDBException, PathAlreadyExistException {
     if (i < 1) {
       return;
     }
+
     String key;
-    if (i == length) {
-      key = createKey(nodes, i, SG_NODE_PREFIX);
-    } else {
-      key = createKey(nodes, i);
-    }
-    Holder<byte[]> holder = new Holder<>();
-    if (!rocksDB.keyMayExist(key.getBytes(), holder)) {
-      createStorageGroup(nodes, i - 1, length);
-    } else {
-      if (holder.getValue() == null) {
-        createStorageGroup(nodes, i - 1, length);
-      }
+    key = createNormalKey(nodes, i);
+
+    boolean exist = keyExist(key);
+    if (exist && i >= length) {
+      throw new PathAlreadyExistException(key);
     }
 
+    if (!exist) {
+      insertByNodes(nodes, i - 1, length);
+      String value = "";
       if (i < length) {
-        byte[] appendVal;
-        // TODO: read raw properties
-        rawValue =
-        appendVal = nodes[i].getBytes();
-        // TODO: append new node to key
-        rocksDB.put(key.getBytes(), "new value".getBytes());
+        value = nodes[i];
       }
-      // TODO: get child value
-       byte[] childValue = "".getBytes();
-      // create child node
-      rocksDB.put(key.getBytes(), childValue);
-
+      createValue(key, value);
+    } else {
+      appendValue(key, nodes[i]);
+    }
   }
 
-  private String createKey(String[] nodes, int len, String prefix) {
-    StringBuilder builder = new StringBuilder();
-    builder.append(ROOT).append(PATH_SEPARATOR).append(prefix);
-    for (int i = 1; i < len; i++) {
-      builder.append(nodes[i]).append(PATH_SEPARATOR).append(prefix);
+  private void appendValue(String key, String toAppend) throws RocksDBException {
+    Lock myLock = locks.get(key);
+    while (true) {
+      if (myLock.tryLock()) {
+        try {
+          byte[] origin = rocksDB.get(key.getBytes());
+          String originStr = new String(origin);
+          if (originStr.indexOf(toAppend) == -1) {
+            byte[] appendVal = (toAppend + "." + originStr).getBytes();
+            rocksDB.put(key.getBytes(), appendVal);
+          }
+        } finally {
+          myLock.unlock();
+        }
+        break;
+      }
     }
-    builder.append(len - 1);
+  }
+
+  private void createValue(String key, String value) throws RocksDBException {
+    Lock myLock = locks.get(key);
+    while (true) {
+      if (myLock.tryLock()) {
+        try {
+          byte[] childValue = value.getBytes();
+          rocksDB.put(key.getBytes(), childValue);
+        } finally {
+          myLock.unlock();
+        }
+        break;
+      }
+    }
+  }
+
+  public void scanAllKeys() {
+    RocksIterator iterator = rocksDB.newIterator();
+    System.out.println("\n-----------------scan rocksdb start----------------------");
+    iterator.seekToFirst();
+    while (iterator.isValid()) {
+      logger.info("{} -> {}", new String(iterator.key()), new String(iterator.value()));
+      iterator.next();
+    }
+    System.out.println("\n-----------------scan rocksdb end----------------------");
+  }
+
+  public void createTimeseries(
+      PartialPath path,
+      TSDataType dataType,
+      TSEncoding encoding,
+      CompressionType compressor,
+      Map<String, String> props,
+      String alias)
+      throws MetadataException {
+    String[] nodes = path.getNodes();
+    try {
+      insertByNodes(nodes, nodes.length, nodes.length);
+    } catch (RocksDBException e) {
+      throw new MetadataException(e);
+    }
+  }
+
+  public IMNode queryByPath(String path) throws RocksDBException {
+    byte[] value = rocksDB.get(path.getBytes());
+    IMNode node = new EntityMNode(null, path);
+    return node;
+  }
+
+  private boolean keyExist(String key, Holder<byte[]> holder) {
+    if (!rocksDB.keyMayExist(key.getBytes(), holder)) {
+      return false;
+    }
+
+    if (holder.getValue() == null) {
+      return false;
+    }
+    return true;
+  }
+
+  private boolean keyExist(String key) {
+    return keyExist(key, new Holder<>());
+  }
+
+  private String createSgKey(String[] nodes) {
+    return createKeyWithPrefix(nodes, SG_NODE_PREFIX);
+  }
+
+  private String createDeviceKey(String[] nodes) {
+    return createKeyWithPrefix(nodes, DEVICE_NODE_PREFIX);
+  }
+
+  private String createMeasurementKey(String[] nodes) {
+    return createKeyWithPrefix(nodes, MEASUREMENT_NODE_PREFIX);
+  }
+
+  private String createKeyWithPrefix(String[] nodes, String prefix) {
+    StringBuilder builder = new StringBuilder();
+    builder.append(prefix).append(PATH_SEPARATOR).append(ROOT);
+    for (int i = 1; i < nodes.length; i++) {
+      builder.append(PATH_SEPARATOR).append(nodes[i]);
+    }
     return builder.toString();
   }
 
-  private String createKey(String[] nodes, int length) {
+  private String createNormalKey(String[] nodes, int end) {
     StringBuilder builder = new StringBuilder();
-    builder.append(ROOT).append(PATH_SEPARATOR);
-    for (int i = 1; i < length - 1; i++) {
-      builder.append(nodes[i]).append(PATH_SEPARATOR).append(SG_NODE_PREFIX);
+    builder.append(ROOT);
+    for (int i = 1; i < end; i++) {
+      builder.append(PATH_SEPARATOR).append(nodes[i]);
     }
-    builder.append(length - 1);
     return builder.toString();
   }
 
-  private String createInternalKey(String[] nodes, int length) {
-    StringBuilder builder = new StringBuilder();
-    builder.append(ROOT).append(PATH_SEPARATOR);
-    for (int i = 1; i < length - 1; i++) {
-      builder.append(nodes[i]).append(PATH_SEPARATOR);
-    }
-    builder.append(length - 1);
-    return builder.toString();
+  public void benchStorageGroupCreation() {
+    BenchmarkTask<SetStorageGroupPlan> task =
+        new BenchmarkTask<>(storageGroups, STORAGE_GROUP_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        setStorageGroupPlan -> {
+          try {
+            setStorageGroup(setStorageGroupPlan.getPath());
+            return true;
+          } catch (Exception e) {
+            return false;
+          }
+        });
+  }
+
+  public void benchTimeSeriesCreation() {
+    BenchmarkTask<List<CreateTimeSeriesPlan>> task =
+        new BenchmarkTask<>(timeSeriesSet, TIME_SERIES_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        createTimeSeriesPlans -> {
+          createTimeSeriesPlans.stream()
+              .forEach(
+                  ts -> {
+                    try {
+                      createTimeseries(
+                          ts.getPath(),
+                          ts.getDataType(),
+                          ts.getEncoding(),
+                          ts.getCompressor(),
+                          ts.getProps(),
+                          ts.getAlias());
+                    } catch (MetadataException e) {
+                      e.printStackTrace();
+                    }
+                  });
+          return true;
+        });
+  }
+
+  public void benchQuery() {
+    BenchmarkTask<String> task =
+        new BenchmarkTask<>(queryTsSet, QUERY_THREAD_NUM, "create storage group", 100);
+    task.runWork(
+        s -> {
+          try {
+            IMNode node = queryByPath(s);
+            if (node != null) {
+              node.toString();
+            }
+            return true;
+          } catch (Exception e) {
+            return false;
+          }
+        });
   }
 
   public void createTimeseries(CreateTimeSeriesPlan plan, long offset) throws MetadataException {
@@ -143,7 +290,6 @@ public class MRocksDBManager {
     // check storage group, create if not exist and auto create schema enabled, otherwise throw
     // StorageGroupNoTSet exception
     // TODO: check storage group
-
 
   }
 }

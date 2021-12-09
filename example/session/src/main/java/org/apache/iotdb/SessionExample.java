@@ -36,11 +36,7 @@ import org.apache.iotdb.tsfile.write.schema.IMeasurementSchema;
 import org.apache.iotdb.tsfile.write.schema.UnaryMeasurementSchema;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 
 @SuppressWarnings("squid:S106")
 public class SessionExample {
@@ -53,12 +49,12 @@ public class SessionExample {
   private static final String ROOT_SG1_D1_S4 = "root.sg1.d1.s4";
   private static final String ROOT_SG1_D1_S5 = "root.sg1.d1.s5";
   private static final String ROOT_SG1_D1 = "root.sg1.d1";
-  private static final String LOCAL_HOST = "127.0.0.1";
+  private static final String LOCAL_HOST = "tsdb09.xstore.bjzdt.qihoo.net";
 
   public static void main(String[] args)
       throws IoTDBConnectionException, StatementExecutionException {
     session =
-        new Session.Builder().host(LOCAL_HOST).port(6667).username("root").password("root").build();
+        new Session.Builder().host(LOCAL_HOST).port(5667).username("root").password("root").build();
     session.open(false);
 
     // set session fetchSize
@@ -72,11 +68,18 @@ public class SessionExample {
       }
     }
 
+    for (int i = 1; i < 2000; i++) {
+      try {
+        session.deleteStorageGroup("root.group_" + i);
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    }
     // createTemplate();
-    createTimeseries();
-    createMultiTimeseries();
-    insertRecord();
-    insertTablet();
+    //    createTimeseries();
+    //    createMultiTimeseries();
+    //    insertRecord();
+    //    insertTablet();
     //    insertTabletWithNullValues();
     //    insertTablets();
     //    insertRecords();
