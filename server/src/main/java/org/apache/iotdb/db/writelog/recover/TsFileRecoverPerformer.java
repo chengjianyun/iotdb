@@ -128,9 +128,19 @@ public class TsFileRecoverPerformer {
         recoverResource();
         return restorableTsFileIOWriter;
       } catch (IOException e) {
+        if (restorableTsFileIOWriter != null) {
+          restorableTsFileIOWriter.close();
+        }
         throw new StorageGroupProcessorException(
             "recover the resource file failed: " + filePath + RESOURCE_SUFFIX + e);
       }
+    } else if (!needRedoWal) {
+      if (restorableTsFileIOWriter != null) {
+        restorableTsFileIOWriter.close();
+      }
+      boolean renameResult = file.renameTo(new File(file.getAbsolutePath() + ".crashed"));
+      throw new StorageGroupProcessorException(
+          "Non 0 level TsFile has crashed and can't recover and rename " + renameResult);
     }
 
     // tsfile has crashed
@@ -148,6 +158,9 @@ public class TsFileRecoverPerformer {
             .deleteNode(
                 logNodePrefix + SystemFileFactory.INSTANCE.getFile(filePath).getName(), consumer);
       } catch (IOException e) {
+        if (restorableTsFileIOWriter != null) {
+          restorableTsFileIOWriter.close();
+        }
         throw new StorageGroupProcessorException(e);
       }
     }
