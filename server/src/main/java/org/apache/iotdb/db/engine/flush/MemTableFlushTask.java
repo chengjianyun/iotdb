@@ -43,6 +43,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * flush task to flush one memtable using a pipeline model to flush, which is sort memtable ->
@@ -68,8 +69,9 @@ public class MemTableFlushTask {
 
   private IMemTable memTable;
 
-  private volatile long memSerializeTime = 0L;
-  private volatile long ioTime = 0L;
+  private AtomicLong memSerializeTime = new AtomicLong(0);
+  private AtomicLong ioTime = new AtomicLong(0);
+  private AtomicLong sortTime = new AtomicLong(0);
 
   /**
    * @param memTable the memTable to flush
@@ -83,7 +85,7 @@ public class MemTableFlushTask {
     this.storageGroup = storageGroup;
     this.encodingTaskFuture = SUB_TASK_POOL_MANAGER.submit(encodingTask);
     this.ioTaskFuture = SUB_TASK_POOL_MANAGER.submit(ioTask);
-    LOGGER.debug(
+    LOGGER.info(
         "flush task of Storage group {} memtable is created, flushing to file {}.",
         storageGroup,
         writer.getFile().getName());
@@ -105,7 +107,6 @@ public class MemTableFlushTask {
       SystemInfo.getInstance().applyTemporaryMemoryForFlushing(estimatedTemporaryMemSize);
     }
     long start = System.currentTimeMillis();
-    long sortTime = 0;
 
     // for map do not use get(key) to iterate
     for (Map.Entry<IDeviceID, IWritableMemChunkGroup> memTableEntry :
@@ -120,27 +121,38 @@ public class MemTableFlushTask {
          * sort task (first task of flush pipeline)
          */
         series.sortTvListForFlush();
-        sortTime += System.currentTimeMillis() - startTime;
+        sortTime.getAndAdd(System.currentTimeMillis() - startTime);
         encodingTaskQueue.put(series);
       }
 
       encodingTaskQueue.put(new EndChunkGroupIoTask());
     }
     encodingTaskQueue.put(new TaskEnd());
-    LOGGER.debug(
-        "Storage group {} memtable flushing into file {}: data sort time cost {} ms.",
+
+    LOGGER.info(
+        "Storage group {} memtable flushing into file {}: data sort finished after {} ms.",
         storageGroup,
         writer.getFile().getName(),
-        sortTime);
+        System.currentTimeMillis() - start);
 
     try {
       encodingTaskFuture.get();
+      LOGGER.info(
+          "Storage group {} memtable flushing into file {}: encoding tasks finished after {} ms.",
+          storageGroup,
+          writer.getFile().getName(),
+          System.currentTimeMillis() - start);
     } catch (InterruptedException | ExecutionException e) {
       ioTaskFuture.cancel(true);
       throw e;
     }
 
     ioTaskFuture.get();
+    LOGGER.info(
+        "Storage group {} memtable flushing into file {}: io tasks finished after {} ms.",
+        storageGroup,
+        writer.getFile().getName(),
+        System.currentTimeMillis() - start);
 
     try {
       writer.writePlanIndices();
@@ -152,7 +164,7 @@ public class MemTableFlushTask {
       if (estimatedTemporaryMemSize != 0) {
         SystemInfo.getInstance().releaseTemporaryMemoryForFlushing(estimatedTemporaryMemSize);
       }
-      SystemInfo.getInstance().setEncodingFasterThanIo(ioTime >= memSerializeTime);
+      SystemInfo.getInstance().setEncodingFasterThanIo(ioTime.get() >= memSerializeTime.get());
     }
 
     if (MetricConfigDescriptor.getInstance().getMetricConfig().getEnableMetric()) {
@@ -223,7 +235,7 @@ public class MemTableFlushTask {
                 LOGGER.error("Put task into ioTaskQueue Interrupted");
                 Thread.currentThread().interrupt();
               }
-              memSerializeTime += System.currentTimeMillis() - starTime;
+              memSerializeTime.addAndGet(System.currentTimeMillis() - starTime);
             }
           }
           try {
@@ -233,7 +245,7 @@ public class MemTableFlushTask {
             Thread.currentThread().interrupt();
           }
 
-          LOGGER.debug(
+          LOGGER.info(
               "Storage group {}, flushing memtable {} into disk: Encoding data cost " + "{} ms.",
               storageGroup,
               writer.getFile().getName(),
@@ -276,9 +288,9 @@ public class MemTableFlushTask {
                 "Storage group {} memtable {}, io task meets error.", storageGroup, memTable, e);
             throw new FlushRunTimeException(e);
           }
-          ioTime += System.currentTimeMillis() - starTime;
+          ioTime.addAndGet(System.currentTimeMillis() - starTime);
         }
-        LOGGER.debug(
+        LOGGER.info(
             "flushing a memtable to file {} in storage group {}, io cost {}ms",
             writer.getFile().getName(),
             storageGroup,
