@@ -275,6 +275,7 @@
         <appender-ref ref="stdout"/>
     </root>
     <logger level="OFF" name="io.moquette.broker.metrics.MQTTMessageLogger"/>
+    <logger level="OFF" name="org.apache.thrift.server.TThreadPoolServer"/>
     <logger level="info" name="org.apache.iotdb.db.service"/>
     <logger level="info" name="org.apache.iotdb.db.conf"/>
     <logger level="info" name="org.apache.iotdb.db.cost.statistic">
